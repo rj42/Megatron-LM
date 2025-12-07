@@ -161,6 +161,11 @@ class GatedDeltaNet(MegatronModule):
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
+        # causal_conv1d with channel last layout requires dim % 8 == 0
+        assert self.conv_dim_local_tp % 8 == 0, (
+            f"conv_dim_local_tp must be divisible by 8 for causal_conv1d, "
+            f"got {self.conv_dim_local_tp}"
+        )
 
         # weight shape: [conv_dim, 1, d_conv]
         # bias shape: [conv_dim]
@@ -338,7 +343,9 @@ class GatedDeltaNet(MegatronModule):
         alpha = alpha.reshape(batch, seq_len, -1)
 
         # Convolution on qkv
-        qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+        # For packed sequences (seq_idx), causal_conv1d requires channel last layout
+        # Don't call .contiguous() to preserve channel last after transpose
+        qkv = qkv.transpose(1, 2)  # b, s, d -> b, d, s
         nvtx_range_push(suffix="conv1d")
         # TODO: support deterministic_mode for causal_conv1d
         assert self.activation in ["silu", "swish"]
