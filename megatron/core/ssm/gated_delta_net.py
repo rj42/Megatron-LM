@@ -205,16 +205,12 @@ class GatedDeltaNet(MegatronModule):
         setattr(self.A_log, "tensor_model_parallel", True)
 
         # Output layernorm before projection
-        # TODO: hf-like behaviour
-        original_zero_centered = self.config.layernorm_zero_centered_gamma
-        self.config.layernorm_zero_centered_gamma = False
         self.out_norm = build_module(
             submodules.out_norm,
             config=self.config,
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
-        self.config.layernorm_zero_centered_gamma = original_zero_centered
 
         self.out_proj = build_module(
             submodules.out_proj,
