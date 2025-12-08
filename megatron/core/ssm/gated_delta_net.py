@@ -42,14 +42,18 @@ try:
 
     HAVE_FLA = True
 except ImportError:
-    chunk_gated_delta_rule = None
-
-    HAVE_FLA = False
+    raise ImportError(
+        "FLA is required for GatedDeltaNet. "
+        "Please install it: pip3 install flash-linear-attention==0.4.0"
+    )
 
 try:
     from causal_conv1d import causal_conv1d_fn
 except ImportError:
-    causal_conv1d_fn = None
+    raise ImportError(
+        "causal_conv1d is required for GatedDeltaNet. "
+        "Please install it: pip3 install causal-conv1d==1.5.3.post1"
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -157,6 +161,11 @@ class GatedDeltaNet(MegatronModule):
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
+        # causal_conv1d with channel last layout requires dim % 8 == 0
+        assert self.conv_dim_local_tp % 8 == 0, (
+            f"conv_dim_local_tp must be divisible by 8 for causal_conv1d, "
+            f"got {self.conv_dim_local_tp}"
+        )
 
         # weight shape: [conv_dim, 1, d_conv]
         # bias shape: [conv_dim]
@@ -297,9 +306,17 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
+        # Handle packed sequences
+        cu_seqlens = None
+        seq_idx = None
         if packed_seq_params is not None:
-            # TODO: support packed sequence
-            raise NotImplementedError("GDN does not support packed sequence for now.")
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+            # Build seq_idx for causal_conv1d: (batch, seqlen)
+            total_tokens = seq_len
+            num_seqs = cu_seqlens.shape[0] - 1
+            seq_idx = torch.zeros((batch, total_tokens), dtype=torch.int32, device=hidden_states.device)
+            for i in range(num_seqs):
+                seq_idx[0, cu_seqlens[i]:cu_seqlens[i+1]] = i
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -326,18 +343,19 @@ class GatedDeltaNet(MegatronModule):
         alpha = alpha.reshape(batch, seq_len, -1)
 
         # Convolution on qkv
-        qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+        # For packed sequences (seq_idx), causal_conv1d requires channel last layout
+        # Don't call .contiguous() to preserve channel last after transpose
+        qkv = qkv.transpose(1, 2)  # b, s, d -> b, d, s
         nvtx_range_push(suffix="conv1d")
-        if (causal_conv1d_fn is None) or self.config.deterministic_mode:
-            qkv = self.act_fn(self.conv1d(qkv)[..., :seq_len])
-        else:
-            assert self.activation in ["silu", "swish"]
-            qkv = causal_conv1d_fn(
-                x=qkv,
-                weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
-                bias=self.conv1d.bias,
-                activation=self.activation,
-            )
+        # TODO: support deterministic_mode for causal_conv1d
+        assert self.activation in ["silu", "swish"]
+        qkv = causal_conv1d_fn(
+            x=qkv,
+            weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
+            bias=self.conv1d.bias,
+            activation=self.activation,
+            seq_idx=seq_idx,
+        )
         nvtx_range_pop(suffix="conv1d")
         # Split qkv into query, key, and value
         qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
@@ -372,28 +390,18 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        if self.config.deterministic_mode:
-            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
-            )
-        else:
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
-            )
+        # TODO: support deterministic_mode for chunk_gated_delta_rule
+        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+        )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         # RMSNorm
