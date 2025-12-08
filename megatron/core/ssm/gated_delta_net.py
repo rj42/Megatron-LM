@@ -344,8 +344,7 @@ class GatedDeltaNet(MegatronModule):
 
         # Convolution on qkv
         # For packed sequences (seq_idx), causal_conv1d requires channel last layout
-        # Don't call .contiguous() to preserve channel last after transpose
-        qkv = qkv.transpose(1, 2)  # b, s, d -> b, d, s
+        qkv = qkv.contiguous().transpose(1, 2)  # b, s, d -> b, d, s
         nvtx_range_push(suffix="conv1d")
         # TODO: support deterministic_mode for causal_conv1d
         assert self.activation in ["silu", "swish"]
