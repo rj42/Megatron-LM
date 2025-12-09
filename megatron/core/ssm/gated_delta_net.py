@@ -346,6 +346,8 @@ class GatedDeltaNet(MegatronModule):
             )
             qkv = scatter_to_tensor_model_parallel_region(qkv)
             gate = scatter_to_tensor_model_parallel_region(gate)
+            alpha = scatter_to_tensor_model_parallel_region(alpha)
+            beta = scatter_to_tensor_model_parallel_region(beta)
         else:
             qkv, gate, beta, alpha = torch.split(
                 qkvzba,
