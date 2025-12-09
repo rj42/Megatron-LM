@@ -69,7 +69,8 @@ class GatedDeltaNetSubmodules:
     Contains the module specs for the input linear, output norm, and output linear layers.
     """
 
-    in_proj: Union[ModuleSpec, type] = IdentityOp
+    qkvz_proj: Union[ModuleSpec, type] = IdentityOp
+    ba_proj: Union[ModuleSpec, type] = IdentityOp
     out_norm: Union[ModuleSpec, type] = IdentityOp
     out_proj: Union[ModuleSpec, type] = IdentityOp
 
@@ -138,61 +139,136 @@ class GatedDeltaNet(MegatronModule):
         self.qk_dim = self.key_head_dim * self.num_key_heads
         self.v_dim = self.value_head_dim * self.num_value_heads
 
+        # TP compatibility checks
+        assert self.num_key_heads % self.tp_size == 0, (
+            f"num_key_heads ({self.num_key_heads}) must be divisible by tp_size ({self.tp_size})"
+        )
+        assert self.num_value_heads % self.num_key_heads == 0, (
+            f"num_value_heads ({self.num_value_heads}) must be divisible by "
+            f"num_key_heads ({self.num_key_heads}) for GQA grouping"
+        )
+
+        # Local dimensions after TP split
+        self.num_key_heads_local = self.num_key_heads // self.tp_size
+        self.num_value_heads_local = self.num_value_heads // self.tp_size
+
+        # Number of value heads per key head group (for GQA-style grouping)
+        self.v_heads_per_kv_group = self.num_value_heads // self.num_key_heads
+
+        # Size of one interleaved group in qkvz projection:
+        # [q_head_dim, k_head_dim, v_head_dim * v_heads_per_group, z_head_dim * v_heads_per_group]
+        self.qkvz_group_dim = (
+            self.key_head_dim
+            + self.key_head_dim
+            + self.value_head_dim * self.v_heads_per_kv_group
+            + self.value_head_dim * self.v_heads_per_kv_group
+        )
+
+        # Size of one interleaved group in ba projection:
+        # [beta_heads_per_group, alpha_heads_per_group]
+        self.ba_group_dim = self.v_heads_per_kv_group * 2
+
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
         # We may remove this restriction in the future.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.num_value_heads * 2
+        self.qkvz_proj_dim = self.qkvz_group_dim * self.num_key_heads
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
-            assert self.in_proj_dim % fp8_align_size == 0, (
+            assert self.qkvz_proj_dim % fp8_align_size == 0, (
                 "For FP8, the innermost dimension of the GDN layer "
-                "input projection output tensor must be a multiple of 16."
+                "QKVZ projection output tensor must be a multiple of 16."
             )
-        self.in_proj = build_module(
-            submodules.in_proj,
+        self.qkvz_proj = build_module(
+            submodules.qkvz_proj,
             self.hidden_size,
-            self.in_proj_dim,
+            self.qkvz_proj_dim,
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
             bias=bias,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name="fc1",
+            tp_comm_buffer_name="qkvz_fc",
             tp_group=self.pg_collection.tp,
         )
 
-        # Conv1d for QKV
-        self.conv_dim = self.qk_dim * 2 + self.v_dim
-        self.conv_dim_local_tp = self.conv_dim // self.tp_size
-        # causal_conv1d with channel last layout requires dim % 8 == 0
-        assert self.conv_dim_local_tp % 8 == 0, (
-            f"conv_dim_local_tp must be divisible by 8 for causal_conv1d, "
-            f"got {self.conv_dim_local_tp}"
+        self.ba_proj_dim = self.ba_group_dim * self.num_key_heads
+        self.ba_proj = build_module(
+            submodules.ba_proj,
+            self.hidden_size,
+            self.ba_proj_dim,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=bias,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name="ba_fc",
+            tp_group=self.pg_collection.tp,
         )
 
-        # weight shape: [conv_dim, 1, d_conv]
-        # bias shape: [conv_dim]
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim_local_tp,
-            out_channels=self.conv_dim_local_tp,
+        # Conv1d for Q, K, V (3 separate conv1d instead of one combined)
+        # Each conv1d handles its own component - this naturally works with TP
+        # since each rank has local heads
+        # causal_conv1d with channel last layout requires dim % 8 == 0
+
+        # Q conv1d - operates on query heads
+        # weight shape: [q_dim_local, 1, d_conv]
+        # bias shape: [q_dim_local]
+        self.q_dim_local = self.key_head_dim * self.num_key_heads_local
+        assert self.q_dim_local % 8 == 0, f"q_dim_local must be divisible by 8, got {self.q_dim_local}"
+        self.q_conv1d = nn.Conv1d(
+            in_channels=self.q_dim_local,
+            out_channels=self.q_dim_local,
             bias=conv_bias,
             kernel_size=self.conv_kernel_dim,
-            groups=self.conv_dim_local_tp,
+            groups=self.q_dim_local,
             padding=self.conv_kernel_dim - 1,
             device=torch.cuda.current_device(),
             dtype=config.params_dtype,
         )
-        setattr(self.conv1d.weight, "tensor_model_parallel", True)
+        setattr(self.q_conv1d.weight, "tensor_model_parallel", True)
         if conv_bias:
-            setattr(self.conv1d.bias, "tensor_model_parallel", True)
+            setattr(self.q_conv1d.bias, "tensor_model_parallel", True)
+
+        # K conv1d - operates on key heads
+        self.k_dim_local = self.key_head_dim * self.num_key_heads_local
+        self.k_conv1d = nn.Conv1d(
+            in_channels=self.k_dim_local,
+            out_channels=self.k_dim_local,
+            bias=conv_bias,
+            kernel_size=self.conv_kernel_dim,
+            groups=self.k_dim_local,
+            padding=self.conv_kernel_dim - 1,
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
+        )
+        setattr(self.k_conv1d.weight, "tensor_model_parallel", True)
+        if conv_bias:
+            setattr(self.k_conv1d.bias, "tensor_model_parallel", True)
+
+        # V conv1d - operates on value heads
+        self.v_dim_local = self.value_head_dim * self.num_value_heads_local
+        assert self.v_dim_local % 8 == 0, f"v_dim_local must be divisible by 8, got {self.v_dim_local}"
+        self.v_conv1d = nn.Conv1d(
+            in_channels=self.v_dim_local,
+            out_channels=self.v_dim_local,
+            bias=conv_bias,
+            kernel_size=self.conv_kernel_dim,
+            groups=self.v_dim_local,
+            padding=self.conv_kernel_dim - 1,
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
+        )
+        setattr(self.v_conv1d.weight, "tensor_model_parallel", True)
+        if conv_bias:
+            setattr(self.v_conv1d.bias, "tensor_model_parallel", True)
 
         # Time step projection (discretization)
-        self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         # dt_bias parameter
         self.dt_bias = nn.Parameter(
             torch.empty(
-                self.num_v_heads_local_tp,
+                self.num_value_heads_local,
                 dtype=config.params_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -201,7 +277,7 @@ class GatedDeltaNet(MegatronModule):
         # A_log parameter
         self.A_log = nn.Parameter(
             torch.empty(
-                self.num_v_heads_local_tp,
+                self.num_value_heads_local,
                 dtype=config.params_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -240,21 +316,107 @@ class GatedDeltaNet(MegatronModule):
             with get_cuda_rng_tracker().fork():
                 # conv1d.weight
                 if self.conv_init is not None:
-                    nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+                    nn.init.uniform_(self.q_conv1d.weight, -self.conv_init, self.conv_init)
+                    nn.init.uniform_(self.k_conv1d.weight, -self.conv_init, self.conv_init)
+                    nn.init.uniform_(self.v_conv1d.weight, -self.conv_init, self.conv_init)
                 # dt_bias
                 torch.ones(
-                    self.num_v_heads_local_tp,
+                    self.num_value_heads_local,
                     out=self.dt_bias.data,
                     dtype=self.config.params_dtype,
                     device=torch.cuda.current_device(),
                 )
                 # A_log
                 A = torch.empty(
-                    self.num_v_heads_local_tp,
+                    self.num_value_heads_local,
                     dtype=self.config.params_dtype,
                     device=torch.cuda.current_device(),
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(A)
+
+    def _deinterleave_qkvz(
+        self, qkvz: Tensor, batch: int, seq_len: int
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Deinterleave QKVZ from grouped format to separate Q, K, V, Z tensors.
+
+        Input layout (after TP split): [b, s, num_key_heads_local * qkvz_group_dim]
+        Each group contains: [q_head, k_head, v_heads..., z_heads...]
+
+        Returns:
+            query: [b, s, num_key_heads_local, key_head_dim]
+            key: [b, s, num_key_heads_local, key_head_dim]
+            value: [b, s, num_value_heads_local, value_head_dim]
+            gate: [b, s, num_value_heads_local, value_head_dim]
+        """
+        # Reshape to expose groups: [b, s, num_key_heads_local, qkvz_group_dim]
+        qkvz = qkvz.reshape(batch, seq_len, self.num_key_heads_local, self.qkvz_group_dim)
+
+        # Split each group into q, k, v, z components
+        q, k, v, z = torch.split(
+            qkvz,
+            [
+                self.key_head_dim,
+                self.key_head_dim,
+                self.value_head_dim * self.v_heads_per_kv_group,
+                self.value_head_dim * self.v_heads_per_kv_group,
+            ],
+            dim=-1,
+        )
+
+        # v, z need reshape: [b, s, num_key_heads_local, v_heads_per_group * v_head_dim]
+        #                 -> [b, s, num_value_heads_local, value_head_dim]
+        v = v.reshape(batch, seq_len, self.num_value_heads_local, self.value_head_dim)
+        z = z.reshape(batch, seq_len, self.num_value_heads_local, self.value_head_dim)
+
+        return q, k, v, z
+
+    def _deinterleave_ba(self, ba: Tensor, batch: int, seq_len: int) -> Tuple[Tensor, Tensor]:
+        """Deinterleave BA from grouped format to separate beta, alpha tensors.
+
+        Input layout (after TP split): [b, s, num_key_heads_local * ba_group_dim]
+        Each group contains: [beta_heads..., alpha_heads...]
+
+        Returns:
+            beta: [b, s, num_value_heads_local]
+            alpha: [b, s, num_value_heads_local]
+        """
+        # Reshape to expose groups: [b, s, num_key_heads_local, ba_group_dim]
+        ba = ba.reshape(batch, seq_len, self.num_key_heads_local, self.ba_group_dim)
+
+        # Split each group
+        beta, alpha = torch.split(
+            ba,
+            [self.v_heads_per_kv_group, self.v_heads_per_kv_group],
+            dim=-1,
+        )
+
+        # Reshape to [b, s, num_value_heads_local]
+        beta = beta.reshape(batch, seq_len, self.num_value_heads_local)
+        alpha = alpha.reshape(batch, seq_len, self.num_value_heads_local)
+
+        return beta, alpha
+
+    def _apply_conv1d(self, x: Tensor, conv: nn.Conv1d, seq_idx: Optional[Tensor] = None) -> Tensor:
+        """Apply causal conv1d to input tensor.
+
+        Args:
+            x: Input tensor [b, s, d]
+            conv: Conv1d module
+            seq_idx: Sequence index for packed sequences
+
+        Returns:
+            Output tensor [b, s, d]
+        """
+        x = x.contiguous().transpose(1, 2)  # [b, s, d] -> [b, d, s]
+        x = causal_conv1d_fn(
+            x=x,
+            weight=conv.weight.squeeze(1),  # d, 1, w -> d, w
+            bias=conv.bias,
+            activation=self.activation,
+            seq_idx=seq_idx,
+        )
+        x = x.transpose(1, 2)  # [b, d, s] -> [b, s, d]
+        return x
 
     def forward(
         self,
@@ -322,89 +484,50 @@ class GatedDeltaNet(MegatronModule):
             for i in range(num_seqs):
                 seq_idx[0, cu_seqlens[i]:cu_seqlens[i+1]] = i
 
-        # Input projection
-        nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
+        # Input projections
+        nvtx_range_push(suffix="qkvz_proj")
+        qkvz, _ = self.qkvz_proj(hidden_states)
+        nvtx_range_pop(suffix="qkvz_proj")
+
+        nvtx_range_push(suffix="ba_proj")
+        ba, _ = self.ba_proj(hidden_states)
+        nvtx_range_pop(suffix="ba_proj")
 
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
-        qkvzba = qkvzba.transpose(0, 1)
+        qkvz = qkvz.transpose(0, 1)
+        ba = ba.transpose(0, 1)
 
-        # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
-        if self.tp_size > 1:
-            qkvzba_full = gather_from_tensor_model_parallel_region(qkvzba)
-            qkv, gate, beta, alpha = torch.split(
-                qkvzba_full,
-                [
-                    self.qk_dim * 2 + self.v_dim,
-                    self.v_dim,
-                    self.num_value_heads,
-                    self.num_value_heads,
-                ],
-                dim=-1,
-            )
-            qkv = scatter_to_tensor_model_parallel_region(qkv)
-            gate = scatter_to_tensor_model_parallel_region(gate)
-            alpha = scatter_to_tensor_model_parallel_region(alpha)
-            beta = scatter_to_tensor_model_parallel_region(beta)
-        else:
-            qkv, gate, beta, alpha = torch.split(
-                qkvzba,
-                [
-                    self.qk_dim * 2 + self.v_dim,
-                    self.v_dim,
-                    self.num_value_heads,
-                    self.num_value_heads,
-                ],
-                dim=-1,
-            )
-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-        beta = beta.reshape(batch, seq_len, -1)
-        alpha = alpha.reshape(batch, seq_len, -1)
+        # Deinterleave into separate components
+        query, key, value, gate = self._deinterleave_qkvz(qkvz, batch, seq_len)
+        beta, alpha = self._deinterleave_ba(ba, batch, seq_len)
 
-        # Convolution on qkv
-        # For packed sequences (seq_idx), causal_conv1d requires channel last layout
-        qkv = qkv.contiguous().transpose(1, 2)  # b, s, d -> b, d, s
+        # Flatten for conv1d: [b, s, num_heads, head_dim] -> [b, s, dim]
+        query = query.reshape(batch, seq_len, -1)
+        key = key.reshape(batch, seq_len, -1)
+        value = value.reshape(batch, seq_len, -1)
+
+        # Convolution on q, k, v
         nvtx_range_push(suffix="conv1d")
         # TODO: support deterministic_mode for causal_conv1d
         assert self.activation in ["silu", "swish"]
-        qkv = causal_conv1d_fn(
-            x=qkv,
-            weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
-            bias=self.conv1d.bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
+        query = self._apply_conv1d(query, self.q_conv1d, seq_idx)
+        key = self._apply_conv1d(key, self.k_conv1d, seq_idx)
+        value = self._apply_conv1d(value, self.v_conv1d, seq_idx)
         nvtx_range_pop(suffix="conv1d")
-        # Split qkv into query, key, and value
-        qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        if self.tp_size > 1:
-            qkv_full = gather_from_tensor_model_parallel_region(qkv)
-            query, key, value = torch.split(
-                qkv_full,
-                [self.qk_dim, self.qk_dim, self.v_dim],
-                dim=-1,
-            )
-            query = scatter_to_tensor_model_parallel_region(query)
-            key = scatter_to_tensor_model_parallel_region(key)
-            value = scatter_to_tensor_model_parallel_region(value)
-        else:
-            query, key, value = torch.split(
-                qkv,
-                [self.qk_dim, self.qk_dim, self.v_dim],
-                dim=-1,
-            )
-        query = query.reshape(batch, seq_len, -1, self.key_head_dim)
-        key = key.reshape(batch, seq_len, -1, self.key_head_dim)
-        value = value.reshape(batch, seq_len, -1, self.value_head_dim)
+
+        # Reshape back to head format
+        query = query.reshape(batch, seq_len, self.num_key_heads_local, self.key_head_dim)
+        key = key.reshape(batch, seq_len, self.num_key_heads_local, self.key_head_dim)
+        value = value.reshape(batch, seq_len, self.num_value_heads_local, self.value_head_dim)
+
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
             query = l2norm(query.contiguous())
             key = l2norm(key.contiguous())
-        if self.num_value_heads // self.num_key_heads > 1:
-            query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
-            key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
+        if self.v_heads_per_kv_group > 1:
+            query = query.repeat_interleave(self.v_heads_per_kv_group, dim=2)
+            key = key.repeat_interleave(self.v_heads_per_kv_group, dim=2)
 
         # Make contiguous
         query = query.contiguous()
@@ -486,12 +609,12 @@ class GatedDeltaNet(MegatronModule):
         # Submodules
         tp_group = tp_group if tp_group is not None else self.pg_collection.tp
         for name, module in self.named_children():
-            if name == "conv1d":
+            if name in ["q_conv1d", "k_conv1d", "v_conv1d"]:
                 # Add TP sharding for Conv1d
                 module_sd = module.state_dict(prefix="", keep_vars=True)
-                tp_sharding_map = {f"weight": 0}
+                tp_sharding_map = {"weight": 0}
                 if self.conv_bias:
-                    tp_sharding_map[f"bias"] = 0
+                    tp_sharding_map["bias"] = 0
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
                     module_sd,
                     f"{prefix}{name}.",
@@ -506,49 +629,6 @@ class GatedDeltaNet(MegatronModule):
                 )
 
             sharded_state_dict.update(module_sharded_sd)
-
-        # At this point the TP sharding is correctly defined for each tensor, but some of the
-        # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            [
-                self.qk_dim // self.tp_size,
-                self.qk_dim // self.tp_size,
-                self.v_dim // self.tp_size,
-                self.v_dim // self.tp_size,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
-            ],
-            ["query", "key", "value", "z", "beta", "alpha"],
-            0,
-        )
-
-        conv_layer_name_list = ["conv1d.weight"]
-        assert (
-            sharded_state_dict[f"{prefix}conv1d.weight"].data.size(0) == self.conv_dim_local_tp
-        ), (self.conv_dim_local_tp, sharded_state_dict[f"{prefix}conv1d.weight"])
-        if self.conv_bias:
-            conv_layer_name_list.append("conv1d.bias")
-            assert (
-                sharded_state_dict[f"{prefix}conv1d.bias"].data.size(0) == self.conv_dim_local_tp
-            ), (self.conv_dim_local_tp, sharded_state_dict[f"{prefix}conv1d.bias"])
-        for conv_layer_name in conv_layer_name_list:
-            sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
-                sharded_state_dict[f"{prefix}{conv_layer_name}"],
-                [
-                    self.qk_dim // self.tp_size,
-                    self.qk_dim // self.tp_size,
-                    self.v_dim // self.tp_size,
-                ],
-                ["query", "key", "value"],
-                0,
-            )
 
         return sharded_state_dict
 

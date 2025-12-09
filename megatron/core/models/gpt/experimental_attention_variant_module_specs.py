@@ -33,7 +33,8 @@ def get_gated_delta_net_module_spec_for_backend(
     attention = ModuleSpec(
         module=GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
-            in_proj=backend.column_parallel_layer_norm_linear(),
+            qkvz_proj=backend.column_parallel_layer_norm_linear(),
+            ba_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
             out_proj=backend.row_parallel_linear(),
         ),
