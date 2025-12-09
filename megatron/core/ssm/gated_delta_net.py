@@ -21,7 +21,11 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel import (
+    gather_from_tensor_model_parallel_region,
+    get_cuda_rng_tracker,
+    scatter_to_tensor_model_parallel_region,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -328,16 +332,31 @@ class GatedDeltaNet(MegatronModule):
         qkvzba = qkvzba.transpose(0, 1)
 
         # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
-        qkv, gate, beta, alpha = torch.split(
-            qkvzba,
-            [
-                (self.qk_dim * 2 + self.v_dim) // self.tp_size,
-                self.v_dim // self.tp_size,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
-            ],
-            dim=-1,
-        )
+        if self.tp_size > 1:
+            qkvzba_full = gather_from_tensor_model_parallel_region(qkvzba)
+            qkv, gate, beta, alpha = torch.split(
+                qkvzba_full,
+                [
+                    self.qk_dim * 2 + self.v_dim,
+                    self.v_dim,
+                    self.num_value_heads,
+                    self.num_value_heads,
+                ],
+                dim=-1,
+            )
+            qkv = scatter_to_tensor_model_parallel_region(qkv)
+            gate = scatter_to_tensor_model_parallel_region(gate)
+        else:
+            qkv, gate, beta, alpha = torch.split(
+                qkvzba,
+                [
+                    self.qk_dim * 2 + self.v_dim,
+                    self.v_dim,
+                    self.num_value_heads,
+                    self.num_value_heads,
+                ],
+                dim=-1,
+            )
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
         beta = beta.reshape(batch, seq_len, -1)
         alpha = alpha.reshape(batch, seq_len, -1)
@@ -358,11 +377,22 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="conv1d")
         # Split qkv into query, key, and value
         qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        query, key, value = torch.split(
-            qkv,
-            [self.qk_dim // self.tp_size, self.qk_dim // self.tp_size, self.v_dim // self.tp_size],
-            dim=-1,
-        )
+        if self.tp_size > 1:
+            qkv_full = gather_from_tensor_model_parallel_region(qkv)
+            query, key, value = torch.split(
+                qkv_full,
+                [self.qk_dim, self.qk_dim, self.v_dim],
+                dim=-1,
+            )
+            query = scatter_to_tensor_model_parallel_region(query)
+            key = scatter_to_tensor_model_parallel_region(key)
+            value = scatter_to_tensor_model_parallel_region(value)
+        else:
+            query, key, value = torch.split(
+                qkv,
+                [self.qk_dim, self.qk_dim, self.v_dim],
+                dim=-1,
+            )
         query = query.reshape(batch, seq_len, -1, self.key_head_dim)
         key = key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
